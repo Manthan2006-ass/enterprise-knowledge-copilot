@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+motor
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+bcrypt==4.0.1
+python-multipart
+pydantic[email]
+chromadb
+ollama
+pypdf
+python-docx
+pytest
+pytest-asyncio
+httpx
