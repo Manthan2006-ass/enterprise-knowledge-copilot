@@ -11,6 +11,7 @@ export default function Sidebar({
   onNewWorkspace,
   onSelectWorkspace,
   onNewWorkspaceThread,
+  onDeleteThread,
   onLogout,
 }) {
   const [expandedWs, setExpandedWs] = useState(activeWorkspaceId);
@@ -19,6 +20,12 @@ export default function Sidebar({
     const next = expandedWs === wsId ? null : wsId;
     setExpandedWs(next);
     if (next) onSelectWorkspace(next);
+  }
+
+  function handleDelete(e, threadId, workspaceId) {
+    // Stop the click from also selecting the thread
+    e.stopPropagation();
+    onDeleteThread(threadId, workspaceId ?? null);
   }
 
   return (
@@ -38,12 +45,17 @@ export default function Sidebar({
           {normalThreads.map((t) => (
             <li
               key={t.thread_id}
-              className={`thread-item ${
-                t.thread_id === activeThreadId ? "active" : ""
-              }`}
+              className={`thread-item ${t.thread_id === activeThreadId ? "active" : ""}`}
               onClick={() => onSelectThread(t.thread_id, null)}
             >
-              {t.title}
+              <span className="thread-title">{t.title}</span>
+              <button
+                className="thread-delete-btn"
+                title="Delete thread"
+                onClick={(e) => handleDelete(e, t.thread_id, null)}
+              >
+                ×
+              </button>
             </li>
           ))}
           {normalThreads.length === 0 && (
@@ -63,25 +75,29 @@ export default function Sidebar({
           {workspaces.map((ws) => (
             <li key={ws.workspace_id}>
               <div
-                className={`workspace-item ${
-                  expandedWs === ws.workspace_id ? "expanded" : ""
-                }`}
+                className={`workspace-item ${expandedWs === ws.workspace_id ? "expanded" : ""}`}
                 onClick={() => toggleWorkspace(ws.workspace_id)}
               >
                 <span className="workspace-dot" />
                 {ws.name}
+                {!ws.is_owner && <span className="ws-badge">shared</span>}
               </div>
               {expandedWs === ws.workspace_id && (
                 <ul className="thread-list nested">
                   {(workspaceThreads[ws.workspace_id] || []).map((t) => (
                     <li
                       key={t.thread_id}
-                      className={`thread-item ws ${
-                        t.thread_id === activeThreadId ? "active" : ""
-                      }`}
+                      className={`thread-item ws ${t.thread_id === activeThreadId ? "active" : ""}`}
                       onClick={() => onSelectThread(t.thread_id, ws.workspace_id)}
                     >
-                      {t.title}
+                      <span className="thread-title">{t.title}</span>
+                      <button
+                        className="thread-delete-btn"
+                        title="Delete thread"
+                        onClick={(e) => handleDelete(e, t.thread_id, ws.workspace_id)}
+                      >
+                        ×
+                      </button>
                     </li>
                   ))}
                   <li

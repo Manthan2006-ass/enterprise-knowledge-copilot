@@ -19,7 +19,11 @@ import database
 import main
 import chat
 import ingestion
+from limiter import limiter
 from main import app
+
+# Disable rate limiting during automated test runs
+limiter.enabled = False
 
 _email_counter = itertools.count(1)
 

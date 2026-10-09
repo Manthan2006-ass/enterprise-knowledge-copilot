@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { toast } from "react-hot-toast";
 import { api } from "../api.js";
 import { useAuth } from "../context/AuthContext.jsx";
 
@@ -63,7 +64,8 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
   const [isStreaming, setIsStreaming] = useState(false);
   const [documents, setDocuments] = useState([]);
   const [uploading, setUploading] = useState(false);
-  const [uploadError, setUploadError] = useState("");
+  const [suggestedQuestions, setSuggestedQuestions] = useState([]);
+  const [loadingQuestions, setLoadingQuestions] = useState(false);
   const abortRef = useRef(null);
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -73,6 +75,7 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
     if (!threadId) return;
     setMessages([]);
     setStreamingText("");
+    setSuggestedQuestions([]);
     api
       .listMessages(token, threadId)
       .then((res) => setMessages(res.messages))
@@ -93,6 +96,22 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [threadId, workspaceId]);
 
+  // Fetch AI-generated suggested questions when opening a workspace thread
+  // Only fires when there are no messages yet (fresh thread) so it doesn't
+  // clutter an already-active conversation.
+  useEffect(() => {
+    if (!workspaceId || !threadId) return;
+    // Don't re-fetch if we already have questions or messages loaded
+    setSuggestedQuestions([]);
+    setLoadingQuestions(true);
+    api
+      .getSuggestedQuestions(token, workspaceId)
+      .then((res) => setSuggestedQuestions(res.questions || []))
+      .catch(() => setSuggestedQuestions([]))
+      .finally(() => setLoadingQuestions(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceId, threadId]);
+
   useEffect(() => {
     if (!scrollRef.current) return;
     // Smooth scrolling triggers layout recalculation - firing it on every
@@ -110,6 +129,45 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
   }, [messages, streamingText, isStreaming]);
 
   const sendingRef = useRef(false);
+
+  // Clicking a chip fills the input and sends immediately
+  function handleChipClick(question) {
+    setSuggestedQuestions([]);
+    setInput("");
+    if (isStreaming || sendingRef.current) return;
+    sendingRef.current = true;
+    setMessages((prev) => [
+      ...prev,
+      { role: "user", content: question, created_at: new Date().toISOString() },
+    ]);
+    setStreamingText("");
+    setIsStreaming(true);
+    abortRef.current = api.streamChat(
+      token,
+      { threadId, workspaceId, question },
+      {
+        onToken: (tok) => setStreamingText((prev) => prev + tok),
+        onDone: () => {
+          sendingRef.current = false;
+          setIsStreaming(false);
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: streamingTextRef.current, created_at: new Date().toISOString() },
+          ]);
+          setStreamingText("");
+        },
+        onError: (msg) => {
+          sendingRef.current = false;
+          setIsStreaming(false);
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `Something went wrong: ${msg}`, created_at: new Date().toISOString() },
+          ]);
+          setStreamingText("");
+        },
+      }
+    );
+  }
 
   function handleSend(e) {
     e.preventDefault();
@@ -175,7 +233,6 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
     const file = e.target.files?.[0];
     if (!file || !workspaceId) return;
     setUploading(true);
-    setUploadError("");
     try {
       const res = await api.uploadDocument(token, workspaceId, file);
       setDocuments((prev) => [
@@ -187,8 +244,9 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
           uploaded_at: new Date().toISOString(),
         },
       ]);
+      toast.success(`"${res.filename}" uploaded — ${res.chunks_indexed} chunks indexed`);
     } catch (err) {
-      setUploadError(err.message);
+      toast.error(err.message || "Upload failed");
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
@@ -202,7 +260,6 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
     const file = e.target.files?.[0];
     if (!file || !workspaceId) return;
     setUploadingTranscript(true);
-    setUploadError("");
     try {
       const res = await api.uploadTranscript(token, workspaceId, file);
       setDocuments((prev) => [
@@ -214,8 +271,9 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
           uploaded_at: new Date().toISOString(),
         },
       ]);
+      toast.success(`Transcript uploaded — ${res.chunks_indexed} chunks indexed`);
     } catch (err) {
-      setUploadError(err.message);
+      toast.error(err.message || "Transcript upload failed");
     } finally {
       setUploadingTranscript(false);
       if (transcriptInputRef.current) transcriptInputRef.current.value = "";
@@ -285,7 +343,6 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
           ))}
         </div>
       )}
-      {uploadError && <div className="auth-error small">{uploadError}</div>}
 
       <div className="messages" ref={scrollRef}>
         {messages.map((m, i) => (
@@ -307,6 +364,31 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
               </ReactMarkdown>
               <span className="cursor" />
             </div>
+          </div>
+        )}
+
+        {/* Magic Suggested Questions - shown only when chat is empty and workspace has docs */}
+        {!isStreaming && messages.length === 0 && workspaceId && (
+          <div className="suggested-questions">
+            {loadingQuestions ? (
+              <p className="sq-label">✨ Generating suggested questions…</p>
+            ) : suggestedQuestions.length > 0 ? (
+              <>
+                <p className="sq-label">✨ Try asking:</p>
+                <div className="sq-chips">
+                  {suggestedQuestions.map((q, i) => (
+                    <button
+                      key={i}
+                      className="sq-chip"
+                      onClick={() => handleChipClick(q)}
+                      disabled={isStreaming}
+                    >
+                      {q}
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : null}
           </div>
         )}
       </div>

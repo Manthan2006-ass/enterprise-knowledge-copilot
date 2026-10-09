@@ -1,4 +1,4 @@
-const BASE_URL = "http://127.0.0.1:8000";
+const BASE_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
 
 function authHeaders(token) {
   return token ? { Authorization: `Bearer ${token}` } : {};
@@ -74,6 +74,15 @@ export const api = {
     return handleJson(res);
   },
 
+  async deleteThread(token, threadId) {
+    const res = await fetch(`${BASE_URL}/api/threads/${threadId}`, {
+      method: "DELETE",
+      headers: authHeaders(token),
+    });
+    return handleJson(res);
+  },
+
+
   async listMessages(token, threadId) {
     const res = await fetch(`${BASE_URL}/api/messages?thread_id=${threadId}`, {
       headers: authHeaders(token),
@@ -112,6 +121,14 @@ export const api = {
   async listDocuments(token, workspaceId) {
     const res = await fetch(
       `${BASE_URL}/api/workspaces/${workspaceId}/documents`,
+      { headers: authHeaders(token) }
+    );
+    return handleJson(res);
+  },
+
+  async getSuggestedQuestions(token, workspaceId) {
+    const res = await fetch(
+      `${BASE_URL}/api/workspaces/${workspaceId}/suggested-questions`,
       { headers: authHeaders(token) }
     );
     return handleJson(res);

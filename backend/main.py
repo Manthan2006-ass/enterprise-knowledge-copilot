@@ -1,8 +1,12 @@
+import os
 from datetime import datetime, timezone
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
+from limiter import limiter
 from database import db
 from models import (
     UserSignupSchema,
@@ -19,21 +23,34 @@ from auth import (
     to_object_id,
 )
 
-from chat import router as chat_router
+from chat import router as chat_router, custom_ollama_client, collection, CHAT_MODEL
 from ingestion import router as ingestion_router
+from llm_provider import chat_completion_sync
 
 app = FastAPI(title="Enterprise Knowledge Copilot")
 
-# Both localhost and 127.0.0.1 are needed — browsers can resolve a local
-# Vite dev server as either, and CORS treats them as different origins
-# even though they point to the same machine.
+# CORS setup: supports local Vite dev servers and cloud deployments (Vercel, custom domains)
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+]
+frontend_url = os.getenv("FRONTEND_URL", "").strip()
+if frontend_url:
+    allowed_origins.extend([u.strip() for u in frontend_url.split(",") if u.strip()])
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.include_router(chat_router)
 app.include_router(ingestion_router)
@@ -54,7 +71,8 @@ async def health_check():
 # -----------------------------
 
 @app.post("/api/auth/signup")
-async def signup(payload: UserSignupSchema):
+@limiter.limit("5/minute")
+async def signup(request: Request, payload: UserSignupSchema):
     existing_user = await db.users.find_one({"email": payload.email})
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -67,7 +85,8 @@ async def signup(payload: UserSignupSchema):
 
 
 @app.post("/api/auth/login")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+@limiter.limit("5/minute")
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     user = await db.users.find_one({"email": form_data.username})
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect email or password")
@@ -156,6 +175,72 @@ async def update_workspace(
     return {"message": "Workspace updated successfully"}
 
 
+@app.get("/api/workspaces/{workspace_id}/suggested-questions")
+async def get_suggested_questions(
+    workspace_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    """Ask the LLM to generate 3 suggested questions based on this workspace's documents.
+    Shows up as clickable chips in the UI when a user opens a fresh chat thread."""
+    import json
+    from starlette.concurrency import run_in_threadpool
+
+    workspace = await db.workspaces.find_one({
+        "_id": to_object_id(workspace_id, "workspace_id"),
+        "$or": [
+            {"user_id": user_id},
+            {"is_public": True},
+        ]
+    })
+    if not workspace:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    # Fetch a few sample chunks from this workspace to ground the questions
+    results = await run_in_threadpool(
+        collection.get,
+        where={"workspace_id": workspace_id},
+        limit=5,
+    )
+    docs = results.get("documents", [])
+    if not docs:
+        return {"questions": [
+            "What topics does this workspace cover?",
+            "Summarise the key ideas in the documents.",
+            "What are the most important takeaways?",
+        ]}
+
+    context = "\n\n".join(docs)
+    prompt = (
+        "You are an AI assistant. Based on the following excerpts from a user's documents, "
+        "suggest exactly 3 short, interesting questions the user could ask to learn more. "
+        "Return ONLY a JSON array of 3 strings, no extra text or markdown.\n\n"
+        f"Excerpts:\n{context}\n\nOutput JSON Array:"
+    )
+
+    try:
+        content = await run_in_threadpool(
+            chat_completion_sync,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        # Strip markdown code fences if the model wraps its output
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1]
+        if content.endswith("```"):
+            content = content.rsplit("```", 1)[0]
+        questions = json.loads(content.strip())
+        if not isinstance(questions, list) or len(questions) < 1:
+            raise ValueError("Not a valid list")
+        return {"questions": questions[:3]}
+    except Exception as e:
+        print(f"[suggested-questions] LLM parse error: {e}")
+        return {"questions": [
+            "What topics does this workspace cover?",
+            "Summarise the key ideas in the documents.",
+            "What are the most important takeaways?",
+        ]}
+
+
 # -----------------------------
 # THREADS
 # -----------------------------
@@ -214,6 +299,27 @@ async def list_threads(
             "created_at": t["created_at"],
         })
     return {"threads": threads}
+
+
+@app.delete("/api/threads/{thread_id}")
+async def delete_thread(
+    thread_id: str,
+    user_id: str = Depends(get_current_user),
+):
+    thread = await db.threads.find_one({
+        "_id": to_object_id(thread_id, "thread_id"),
+        "user_id": user_id,
+    })
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    # Delete the thread and all its messages together — orphaned messages
+    # waste storage and could leak context if a thread_id is ever reused.
+    await db.threads.delete_one({"_id": thread["_id"]})
+    await db.messages.delete_many({"thread_id": thread_id})
+
+    return {"message": "Thread deleted successfully"}
+
 
 
 # -----------------------------

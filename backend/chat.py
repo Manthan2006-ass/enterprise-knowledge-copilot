@@ -2,8 +2,10 @@ import json
 import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+
+from limiter import limiter
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -12,6 +14,7 @@ from ollama import Client as OllamaClient
 from database import db
 from auth import get_current_user, to_object_id
 from models import ChatPayloadSchema
+from llm_provider import chat_completion_sync, chat_completion_stream
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -31,21 +34,27 @@ chroma_client = chromadb.PersistentClient(path=DB_PATH)
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
 # Default timeout is too short for embedding/generation on CPU under load —
-# same fix applied in ingestion.py.
-custom_ollama_client = OllamaClient(
-    host=OLLAMA_BASE_URL,
-    timeout=300.0,
-)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "ollama").strip().lower()
 
-ollama_ef = embedding_functions.OllamaEmbeddingFunction(
-    url=f"{OLLAMA_BASE_URL}/api/embeddings",
-    model_name="bge-m3:latest",
-)
-ollama_ef._client = custom_ollama_client
+if EMBEDDING_PROVIDER == "default":
+    # 100% Python ONNX embedding (all-MiniLM-L6-v2), runs on cloud without Ollama
+    ef = embedding_functions.DefaultEmbeddingFunction()
+    custom_ollama_client = None
+else:
+    custom_ollama_client = OllamaClient(
+        host=OLLAMA_BASE_URL,
+        timeout=300.0,
+    )
+    ollama_ef = embedding_functions.OllamaEmbeddingFunction(
+        url=f"{OLLAMA_BASE_URL}/api/embeddings",
+        model_name="bge-m3:latest",
+    )
+    ollama_ef._client = custom_ollama_client
+    ef = ollama_ef
 
 collection = chroma_client.get_or_create_collection(
     name="workspace_documents",
-    embedding_function=ollama_ef,
+    embedding_function=ef,
     metadata={"hnsw:space": "cosine"},
 )
 
@@ -89,12 +98,10 @@ def condense_query(user_query: str, history: list) -> str:
         "Standalone Query:"
     )
 
-    response = custom_ollama_client.chat(
-        model=CHAT_MODEL,
+    return chat_completion_sync(
         messages=[{"role": "user", "content": condense_prompt}],
-        options={"temperature": 0.0},
+        temperature=0.0,
     )
-    return response["message"]["content"].strip()
 
 
 async def get_recent_history(thread_id: str, limit: int = 8) -> list:
@@ -233,15 +240,7 @@ async def stream_chat_response(user_id: str, thread_id: str, workspace_id: str |
     messages.append({"role": "user", "content": user_prompt})
 
     full_response = ""
-    stream = custom_ollama_client.chat(
-        model=CHAT_MODEL,
-        messages=messages,
-        options={"temperature": 0.0},
-        stream=True,
-    )
-
-    for chunk in stream:
-        token = chunk["message"]["content"]
+    for token in chat_completion_stream(messages, temperature=0.0):
         full_response += token
         yield sse_event({"token": token})
 
@@ -259,7 +258,9 @@ async def stream_chat_response(user_id: str, thread_id: str, workspace_id: str |
 
 
 @router.post("/stream")
+@limiter.limit("15/minute")
 async def chat_stream(
+    request: Request,
     body: ChatPayloadSchema,
     user_id: str = Depends(get_current_user),
 ):
@@ -285,3 +286,4 @@ async def chat_stream(
         stream_chat_response(user_id, body.thread_id, thread["workspace_id"], body.question),
         media_type="text/event-stream",
     )
+

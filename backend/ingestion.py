@@ -4,8 +4,10 @@ import os
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request
 from starlette.concurrency import run_in_threadpool
+
+from limiter import limiter
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -32,26 +34,34 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 # Default timeout is too short for embedding large batches on CPU —
 # without this, a big upload can crash with a ConnectionError/timeout
 # partway through.
-custom_ollama_client = OllamaClient(
-    host=OLLAMA_BASE_URL,
-    timeout=300.0,
-)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "ollama").strip().lower()
 
-ollama_ef = embedding_functions.OllamaEmbeddingFunction(
-    url=f"{OLLAMA_BASE_URL}/api/embeddings",
-    model_name="bge-m3:latest",
-)
-ollama_ef._client = custom_ollama_client
+if EMBEDDING_PROVIDER == "default":
+    # 100% Python ONNX embedding (all-MiniLM-L6-v2), runs on cloud without Ollama
+    ef = embedding_functions.DefaultEmbeddingFunction()
+    custom_ollama_client = None
+else:
+    custom_ollama_client = OllamaClient(
+        host=OLLAMA_BASE_URL,
+        timeout=300.0,
+    )
+    ollama_ef = embedding_functions.OllamaEmbeddingFunction(
+        url=f"{OLLAMA_BASE_URL}/api/embeddings",
+        model_name="bge-m3:latest",
+    )
+    ollama_ef._client = custom_ollama_client
+    ef = ollama_ef
 
 collection = chroma_client.get_or_create_collection(
     name="workspace_documents",
-    embedding_function=ollama_ef,
+    embedding_function=ef,
     metadata={"hnsw:space": "cosine"},
 )
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 BATCH_SIZE = 20
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 
 def extract_text(filename: str, content: bytes) -> str:
@@ -79,7 +89,9 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
 
 
 @router.post("/{workspace_id}/documents/upload")
+@limiter.limit("10/minute")
 async def upload_document(
+    request: Request,
     workspace_id: str,
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user),
@@ -93,6 +105,9 @@ async def upload_document(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File too large. Maximum size is 5MB.")
+
     # PdfReader/docx.Document are synchronous, CPU-bound parsers — running
     # them directly inside this async def would freeze FastAPI's single
     # event loop, stalling every other user's streaming chat until parsing
@@ -178,7 +193,9 @@ async def list_documents(
 
 
 @router.post("/{workspace_id}/documents/upload-transcript")
+@limiter.limit("10/minute")
 async def upload_transcript(
+    request: Request,
     workspace_id: str,
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user),
@@ -204,6 +221,9 @@ async def upload_transcript(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="Transcript file too large. Maximum size is 5MB.")
+        
     try:
         data = await run_in_threadpool(json.loads, content)
     except json.JSONDecodeError:

@@ -5,6 +5,9 @@ import Login from "./pages/Login.jsx";
 import Signup from "./pages/Signup.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import ChatWindow from "./components/ChatWindow.jsx";
+import WelcomeScreen from "./components/WelcomeScreen.jsx";
+import Modal from "./components/Modal.jsx";
+import { Toaster, toast } from "react-hot-toast";
 
 export default function App() {
   const { token, checking, logout } = useAuth();
@@ -17,6 +20,10 @@ export default function App() {
   const [activeThreadId, setActiveThreadId] = useState(null);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(null);
   const [activeThreadTitle, setActiveThreadTitle] = useState("");
+
+  // Modal state — which modal is open and for which workspace
+  const [modal, setModal] = useState(null);
+  // modal = { type: "normal-chat" | "new-workspace" | "new-thread", workspaceId?: string }
 
   const refreshWorkspaces = useCallback(async () => {
     if (!token) return;
@@ -50,11 +57,6 @@ export default function App() {
     setActiveThreadId(threadId);
     setActiveWorkspaceId(workspaceId);
 
-    // When called right after creating a thread, the normalThreads /
-    // workspaceThreads state hasn't re-rendered with the new entry yet
-    // (setState is async), so looking it up here would find nothing and
-    // silently fall back to "Chat". Passing the title explicitly at
-    // creation time sidesteps that race entirely.
     if (explicitTitle) {
       setActiveThreadTitle(explicitTitle);
       return;
@@ -67,19 +69,38 @@ export default function App() {
     setActiveThreadTitle(found ? found.title : "Chat");
   }
 
-  async function handleNewNormalChat() {
-    const title = window.prompt("Name this chat:", "New chat");
-    if (!title) return;
+  // ---- Modal confirm handlers ----
+
+  async function handleConfirmNormalChat(title) {
+    setModal(null);
     const res = await api.createThread(token, title, null);
     await refreshNormalThreads();
     selectThread(res.thread_id, null, title);
   }
 
-  async function handleNewWorkspace() {
-    const name = window.prompt("Workspace name:", "New workspace");
-    if (!name) return;
+  async function handleConfirmNewWorkspace(name) {
+    setModal(null);
     await api.createWorkspace(token, name);
     await refreshWorkspaces();
+  }
+
+  async function handleConfirmNewThread(title) {
+    const workspaceId = modal?.workspaceId;
+    setModal(null);
+    if (!workspaceId) return;
+    const res = await api.createThread(token, title, workspaceId);
+    await refreshWorkspaceThreads(workspaceId);
+    selectThread(res.thread_id, workspaceId, title);
+  }
+
+  // ---- Trigger modal opens ----
+
+  function handleNewNormalChat() {
+    setModal({ type: "normal-chat" });
+  }
+
+  function handleNewWorkspace() {
+    setModal({ type: "new-workspace" });
   }
 
   async function handleSelectWorkspace(workspaceId) {
@@ -87,12 +108,66 @@ export default function App() {
     await refreshWorkspaceThreads(workspaceId);
   }
 
-  async function handleNewWorkspaceThread(workspaceId) {
-    const title = window.prompt("Name this thread:", "New thread");
-    if (!title) return;
-    const res = await api.createThread(token, title, workspaceId);
-    await refreshWorkspaceThreads(workspaceId);
-    selectThread(res.thread_id, workspaceId, title);
+  function handleNewWorkspaceThread(workspaceId) {
+    setModal({ type: "new-thread", workspaceId });
+  }
+
+  async function handleDeleteThread(threadId, workspaceId) {
+    try {
+      await api.deleteThread(token, threadId);
+      // If the deleted thread was active, clear the view
+      if (activeThreadId === threadId) {
+        setActiveThreadId(null);
+        setActiveWorkspaceId(null);
+        setActiveThreadTitle("");
+      }
+      // Refresh the correct thread list
+      if (workspaceId) {
+        await refreshWorkspaceThreads(workspaceId);
+      } else {
+        await refreshNormalThreads();
+      }
+      toast.success("Thread deleted");
+    } catch (err) {
+      toast.error(err.message || "Failed to delete thread");
+    }
+  }
+
+  // ---- Modal rendering logic ----
+
+  function renderModal() {
+    if (!modal) return null;
+    if (modal.type === "normal-chat") {
+      return (
+        <Modal
+          title="Start a new chat"
+          placeholder="Give this conversation a name…"
+          onConfirm={handleConfirmNormalChat}
+          onClose={() => setModal(null)}
+        />
+      );
+    }
+    if (modal.type === "new-workspace") {
+      return (
+        <Modal
+          title="Create a workspace"
+          placeholder="e.g. My AI Project Notes"
+          onConfirm={handleConfirmNewWorkspace}
+          onClose={() => setModal(null)}
+        />
+      );
+    }
+    if (modal.type === "new-thread") {
+      return (
+        <Modal
+          title="New thread"
+          placeholder="Give this thread a name…"
+          onConfirm={handleConfirmNewThread}
+          onClose={() => setModal(null)}
+        />
+      );
+    }
+    return null;
   }
 
   if (checking) {
@@ -109,6 +184,13 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <Toaster
+        position="bottom-right"
+        toastOptions={{
+          style: { fontFamily: "Inter, sans-serif", fontSize: "13.5px" },
+          success: { iconTheme: { primary: "#5b7f62", secondary: "#fff" } },
+        }}
+      />
       <Sidebar
         workspaces={workspaces}
         normalThreads={normalThreads}
@@ -120,16 +202,33 @@ export default function App() {
         onNewWorkspace={handleNewWorkspace}
         onSelectWorkspace={handleSelectWorkspace}
         onNewWorkspaceThread={handleNewWorkspaceThread}
+        onDeleteThread={handleDeleteThread}
         onLogout={logout}
       />
-      <ChatWindow
-        threadId={activeThreadId}
-        workspaceId={activeWorkspaceId}
-        threadTitle={activeThreadTitle}
-        isWorkspaceOwner={
-          workspaces.find((w) => w.workspace_id === activeWorkspaceId)?.is_owner ?? true
-        }
-      />
+
+      {/* Show welcome screen when no thread is selected */}
+      {!activeThreadId ? (
+        <WelcomeScreen
+          workspaces={workspaces}
+          onNewNormalChat={handleNewNormalChat}
+          onNewWorkspace={handleNewWorkspace}
+          onSelectWorkspace={handleSelectWorkspace}
+          onNewWorkspaceThread={handleNewWorkspaceThread}
+        />
+      ) : (
+        <ChatWindow
+          threadId={activeThreadId}
+          workspaceId={activeWorkspaceId}
+          threadTitle={activeThreadTitle}
+          isWorkspaceOwner={
+            workspaces.find((w) => w.workspace_id === activeWorkspaceId)
+              ?.is_owner ?? true
+          }
+        />
+      )}
+
+      {/* Modal overlay — rendered on top of everything */}
+      {renderModal()}
     </div>
   );
 }
