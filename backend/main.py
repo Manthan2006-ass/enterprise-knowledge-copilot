@@ -111,6 +111,19 @@ async def health_check():
     return {"status": "healthy", "mongodb": "connected"}
 
 
+@app.get("/debug/embed-test")
+async def embed_test():
+    """Diagnostic: tests whether the ONNX embedding function works on this host."""
+    from starlette.concurrency import run_in_threadpool
+    import traceback
+    try:
+        from embedding_utils import embed_query
+        vec = await run_in_threadpool(embed_query, "test sentence for embedding")
+        return {"status": "ok", "dims": len(vec), "sample": vec[:3]}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+
+
 # -----------------------------
 # AUTH
 # -----------------------------

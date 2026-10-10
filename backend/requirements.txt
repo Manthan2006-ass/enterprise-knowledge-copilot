@@ -8,6 +8,8 @@ bcrypt==4.0.1
 python-multipart
 pydantic[email]
 chromadb
+onnxruntime
+tokenizers
 ollama
 pypdf
 python-docx
