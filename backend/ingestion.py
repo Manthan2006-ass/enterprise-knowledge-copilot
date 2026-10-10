@@ -8,55 +8,14 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Request
 from starlette.concurrency import run_in_threadpool
 
 from limiter import limiter
-
-import chromadb
-from chromadb.utils import embedding_functions
-from ollama import Client as OllamaClient
 from pypdf import PdfReader
 import docx
 
 from database import db
 from auth import get_current_user, to_object_id
+from embedding_utils import embed_texts
 
 router = APIRouter(prefix="/api/workspaces", tags=["ingestion"])
-
-# Same collection instance/config as chat.py — must match exactly, since
-# both files query and write to the same ChromaDB collection.
-DB_PATH = "./chroma_db"
-chroma_client = chromadb.PersistentClient(path=DB_PATH)
-
-# Defaults to localhost for normal local dev. Inside Docker, "localhost"
-# refers to THIS container, not the Ollama container - docker-compose
-# overrides this via an environment variable to the service name instead
-# (e.g. http://ollama:11434).
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-
-# Default timeout is too short for embedding large batches on CPU —
-# without this, a big upload can crash with a ConnectionError/timeout
-# partway through.
-EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "ollama").strip().lower()
-
-if EMBEDDING_PROVIDER == "default":
-    # 100% Python ONNX embedding (all-MiniLM-L6-v2), runs on cloud without Ollama
-    ef = embedding_functions.DefaultEmbeddingFunction()
-    custom_ollama_client = None
-else:
-    custom_ollama_client = OllamaClient(
-        host=OLLAMA_BASE_URL,
-        timeout=300.0,
-    )
-    ollama_ef = embedding_functions.OllamaEmbeddingFunction(
-        url=f"{OLLAMA_BASE_URL}/api/embeddings",
-        model_name="bge-m3:latest",
-    )
-    ollama_ef._client = custom_ollama_client
-    ef = ollama_ef
-
-collection = chroma_client.get_or_create_collection(
-    name="workspace_documents",
-    embedding_function=ef,
-    metadata={"hnsw:space": "cosine"},
-)
 
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
@@ -88,6 +47,24 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
     return [c.strip() for c in chunks if c.strip()]
 
 
+def _embed_and_build_docs(chunks, metadatas, doc_id):
+    """Synchronous helper: embed all chunks in batches and return MongoDB docs."""
+    mongo_docs = []
+    for i in range(0, len(chunks), BATCH_SIZE):
+        batch_texts = chunks[i:i + BATCH_SIZE]
+        batch_metas = metadatas[i:i + BATCH_SIZE]
+        embeddings = embed_texts(batch_texts)
+        for j, (text, meta, emb) in enumerate(zip(batch_texts, batch_metas, embeddings)):
+            mongo_docs.append({
+                **meta,
+                "doc_id": doc_id,
+                "chunk_index": i + j,
+                "text": text,
+                "embedding": emb,
+            })
+    return mongo_docs
+
+
 @router.post("/{workspace_id}/documents/upload")
 @limiter.limit("10/minute")
 async def upload_document(
@@ -108,10 +85,6 @@ async def upload_document(
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="File too large. Maximum size is 5MB.")
 
-    # PdfReader/docx.Document are synchronous, CPU-bound parsers — running
-    # them directly inside this async def would freeze FastAPI's single
-    # event loop, stalling every other user's streaming chat until parsing
-    # finishes. run_in_threadpool moves the blocking work off the event loop.
     text = await run_in_threadpool(extract_text, file.filename, content)
     if not text.strip():
         raise HTTPException(status_code=400, detail="No extractable text found in file")
@@ -121,26 +94,17 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="File produced no usable chunks")
 
     doc_id = str(uuid.uuid4())
-    ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-    metadatas = [
-        {
-            "user_id": user_id,
-            "workspace_id": workspace_id,
-            "source": file.filename,
-            "chunk_index": i,
-        }
-        for i in range(len(chunks))
-    ]
+    base_meta = {
+        "user_id": user_id,
+        "workspace_id": workspace_id,
+        "source": file.filename,
+    }
+    metadatas = [base_meta for _ in chunks]
 
-    # collection.add() makes a synchronous HTTP call to Ollama for embeddings
-    # and writes to disk — also blocking, also moved off the event loop.
-    for i in range(0, len(chunks), BATCH_SIZE):
-        await run_in_threadpool(
-            collection.add,
-            documents=chunks[i:i + BATCH_SIZE],
-            metadatas=metadatas[i:i + BATCH_SIZE],
-            ids=ids[i:i + BATCH_SIZE],
-        )
+    # Embed all chunks and build MongoDB docs (CPU-bound → run off event loop)
+    mongo_docs = await run_in_threadpool(_embed_and_build_docs, chunks, metadatas, doc_id)
+    if mongo_docs:
+        await db.chunks.insert_many(mongo_docs)
 
     await db.documents.insert_one({
         "workspace_id": workspace_id,
@@ -164,8 +128,7 @@ async def list_documents(
     workspace_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    # Allow access if owned OR public - anyone can SEE what's indexed in a
-    # shared workspace, even though only the owner can upload into it.
+    # Allow access if owned OR public
     workspace = await db.workspaces.find_one({
         "_id": to_object_id(workspace_id, "workspace_id"),
         "$or": [
@@ -176,10 +139,6 @@ async def list_documents(
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    # Filter by workspace_id ONLY, not also user_id - documents in a public
-    # workspace were uploaded by the OWNER, not the current viewer, so
-    # filtering by the viewer's own user_id would incorrectly return nothing
-    # for anyone except the original uploader.
     cursor = db.documents.find({"workspace_id": workspace_id})
     docs = []
     async for d in cursor:
@@ -201,14 +160,14 @@ async def upload_transcript(
     user_id: str = Depends(get_current_user),
 ):
     """
-    Uploads a pre-transcribed JSON file (the output of mp3tojson.py + merge_chunks.py
-    from the video-lecture pipeline) and indexes each chunk WITH its start/end
-    timestamps, so chat.py can cite [Lecture XX at MM:SS] when answering from it.
+    Uploads a pre-transcribed JSON file and indexes each chunk WITH its
+    start/end timestamps into MongoDB Atlas Vector Search, so chat.py can
+    cite [Lecture XX at MM:SS] when answering.
 
     Expected JSON shape:
     {
       "chunks": [
-        {"number": "12", "title": "Attention Mechanism", "start": 45.2, "end": 62.8, "text": "..."},
+        {"number": "12", "title": "...", "start": 45.2, "end": 62.8, "text": "..."},
         ...
       ]
     }
@@ -223,52 +182,48 @@ async def upload_transcript(
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=400, detail="Transcript file too large. Maximum size is 5MB.")
-        
+
     try:
         data = await run_in_threadpool(json.loads, content)
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON transcript file")
 
-    chunks = data.get("chunks", [])
-    if not chunks:
+    raw_chunks = data.get("chunks", [])
+    if not raw_chunks:
         raise HTTPException(status_code=400, detail="No chunks found in transcript JSON")
 
     doc_id = str(uuid.uuid4())
-    documents, metadatas, ids = [], [], []
+    texts, metadatas = [], []
 
-    for i, chunk in enumerate(chunks):
+    for chunk in raw_chunks:
         text = (chunk.get("text") or "").strip()
         if not text:
             continue
-        documents.append(text)
+        texts.append(text)
         metadatas.append({
             "user_id": user_id,
             "workspace_id": workspace_id,
             "source": chunk.get("title", file.filename),
-            "video_number": chunk.get("number", "unknown"),
+            "video_number": str(chunk.get("number", "unknown")),
             "video_title": chunk.get("title", file.filename),
             "start_time": float(chunk.get("start", 0)),
             "end_time": float(chunk.get("end", 0)),
-            "chunk_index": i,
+            "has_timestamps": True,
         })
-        ids.append(f"{doc_id}_{i}")
 
-    if not documents:
+    if not texts:
         raise HTTPException(status_code=400, detail="Transcript produced no usable text chunks")
 
-    for i in range(0, len(documents), BATCH_SIZE):
-        await run_in_threadpool(
-            collection.add,
-            documents=documents[i:i + BATCH_SIZE],
-            metadatas=metadatas[i:i + BATCH_SIZE],
-            ids=ids[i:i + BATCH_SIZE],
-        )
+    # Embed all chunks (CPU-bound → off event loop)
+    mongo_docs = await run_in_threadpool(_embed_and_build_docs, texts, metadatas, doc_id)
+    if mongo_docs:
+        await db.chunks.insert_many(mongo_docs)
 
     await db.documents.insert_one({
         "workspace_id": workspace_id,
         "user_id": user_id,
         "filename": file.filename,
-        "chunk_count": len(documents),
+        "chunk_count": len(texts),
         "doc_id": doc_id,
         "has_timestamps": True,
         "uploaded_at": datetime.now(timezone.utc),
@@ -277,7 +232,6 @@ async def upload_transcript(
     return {
         "doc_id": doc_id,
         "filename": file.filename,
-        "chunks_indexed": len(documents),
+        "chunks_indexed": len(texts),
         "message": "Transcript uploaded and indexed with timestamps",
     }
-

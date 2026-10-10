@@ -5,6 +5,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from contextlib import asynccontextmanager
 
 from limiter import limiter
 from database import db
@@ -23,11 +24,55 @@ from auth import (
     to_object_id,
 )
 
-from chat import router as chat_router, custom_ollama_client, collection, CHAT_MODEL
+from chat import router as chat_router
 from ingestion import router as ingestion_router
 from llm_provider import chat_completion_sync
 
-app = FastAPI(title="Enterprise Knowledge Copilot")
+
+async def _ensure_vector_index():
+    """Create the Atlas Vector Search index on db.chunks if it doesn't already exist.
+    Safe to call on every startup — Atlas ignores the request if the index exists."""
+    try:
+        existing = await db.command({"listSearchIndexes": "chunks"})
+        names = [idx.get("name") for idx in existing.get("cursor", {}).get("firstBatch", [])]
+        if "vector_index" not in names:
+            await db.command({
+                "createSearchIndexes": "chunks",
+                "indexes": [{
+                    "name": "vector_index",
+                    "type": "vectorSearch",
+                    "definition": {
+                        "fields": [
+                            {
+                                "type": "vector",
+                                "path": "embedding",
+                                "numDimensions": 384,
+                                "similarity": "cosine",
+                            },
+                            {
+                                "type": "filter",
+                                "path": "workspace_id",
+                            },
+                        ]
+                    },
+                }],
+            })
+            print("[startup] Atlas vector search index 'vector_index' created.")
+        else:
+            print("[startup] Atlas vector search index 'vector_index' already exists.")
+        # Regular index for fast workspace_id lookups on the chunks collection
+        await db.chunks.create_index("workspace_id", background=True)
+    except Exception as e:
+        print(f"[startup] Vector index setup warning: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _ensure_vector_index()
+    yield
+
+
+app = FastAPI(title="Enterprise Knowledge Copilot", lifespan=lifespan)
 
 # CORS setup: supports local Vite dev servers and cloud deployments (Vercel, custom domains)
 allowed_origins = [
@@ -196,12 +241,11 @@ async def get_suggested_questions(
         raise HTTPException(status_code=404, detail="Workspace not found")
 
     # Fetch a few sample chunks from this workspace to ground the questions
-    results = await run_in_threadpool(
-        collection.get,
-        where={"workspace_id": workspace_id},
-        limit=5,
-    )
-    docs = results.get("documents", [])
+    cursor = db.chunks.find({"workspace_id": workspace_id}, {"text": 1, "_id": 0}).limit(5)
+    docs = []
+    async for chunk in cursor:
+        if chunk.get("text"):
+            docs.append(chunk["text"])
     if not docs:
         return {"questions": [
             "What topics does this workspace cover?",
@@ -209,7 +253,7 @@ async def get_suggested_questions(
             "What are the most important takeaways?",
         ]}
 
-    context = "\n\n".join(docs)
+    context = "\n\n".join(docs[:5])
     prompt = (
         "You are an AI assistant. Based on the following excerpts from a user's documents, "
         "suggest exactly 3 short, interesting questions the user could ask to learn more. "
