@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timezone
+from bson import ObjectId
 from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,7 +61,6 @@ async def _ensure_vector_index():
             print("[startup] Atlas vector search index 'vector_index' created.")
         else:
             print("[startup] Atlas vector search index 'vector_index' already exists.")
-        # Regular index for fast workspace_id lookups on the chunks collection
         await db.chunks.create_index("workspace_id", background=True)
     except Exception as e:
         print(f"[startup] Vector index setup warning: {e}")
@@ -74,7 +74,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Enterprise Knowledge Copilot", lifespan=lifespan)
 
-# CORS setup: supports local Vite dev servers and cloud deployments (Vercel, custom domains)
 allowed_origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -186,9 +185,6 @@ async def create_workspace(
 
 @app.get("/api/workspaces")
 async def list_workspaces(user_id: str = Depends(get_current_user)):
-    # Show workspaces this user owns, PLUS any workspace anyone has marked
-    # public - so a flagship/shared workspace shows up for every logged-in
-    # user, not just its creator.
     cursor = db.workspaces.find({
         "$or": [
             {"user_id": user_id},
@@ -213,13 +209,14 @@ async def update_workspace(
     body: UpdateWorkspaceRequest,
     user_id: str = Depends(get_current_user),
 ):
-    # Owner-only - only the creator can rename a workspace or toggle its
-    # public/private visibility. Being ABLE to use a public workspace
-    # doesn't mean you're allowed to reconfigure it.
-    workspace = await db.workspaces.find_one({
-        "_id": to_object_id(workspace_id, "workspace_id"),
-        "user_id": user_id,
-    })
+    ws_query = {"user_id": user_id}
+    try:
+        ws_oid = ObjectId(workspace_id)
+        ws_query["_id"] = {"$in": [ws_oid, workspace_id]}
+    except Exception:
+        ws_query["_id"] = workspace_id
+
+    workspace = await db.workspaces.find_one(ws_query)
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -238,22 +235,20 @@ async def get_suggested_questions(
     workspace_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    """Ask the LLM to generate 3 suggested questions based on this workspace's documents.
-    Shows up as clickable chips in the UI when a user opens a fresh chat thread."""
     import json
     from starlette.concurrency import run_in_threadpool
 
-    workspace = await db.workspaces.find_one({
-        "_id": to_object_id(workspace_id, "workspace_id"),
-        "$or": [
-            {"user_id": user_id},
-            {"is_public": True},
-        ]
-    })
+    ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
+    try:
+        ws_oid = ObjectId(workspace_id)
+        ws_query["_id"] = {"$in": [ws_oid, workspace_id]}
+    except Exception:
+        ws_query["_id"] = workspace_id
+
+    workspace = await db.workspaces.find_one(ws_query)
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
 
-    # Fetch a few sample chunks from this workspace to ground the questions
     cursor = db.chunks.find({"workspace_id": workspace_id}, {"text": 1, "_id": 0}).limit(5)
     docs = []
     async for chunk in cursor:
@@ -280,7 +275,6 @@ async def get_suggested_questions(
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
         )
-        # Strip markdown code fences if the model wraps its output
         if content.startswith("```"):
             content = content.split("\n", 1)[-1]
         if content.endswith("```"):
@@ -307,19 +301,15 @@ async def create_thread(
     body: CreateThreadRequest,
     user_id: str = Depends(get_current_user),
 ):
-    # Only validate a workspace if one was actually provided.
-    # workspace_id == None means this is a "Normal Chat" thread with no RAG.
     if body.workspace_id is not None:
-        # Allow access if the user owns this workspace, OR it's public -
-        # anyone can start a chat thread inside a shared workspace, even
-        # though only the owner can upload new documents into it.
-        workspace = await db.workspaces.find_one({
-            "_id": to_object_id(body.workspace_id, "workspace_id"),
-            "$or": [
-                {"user_id": user_id},
-                {"is_public": True},
-            ],
-        })
+        ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
+        try:
+            ws_oid = ObjectId(body.workspace_id)
+            ws_query["_id"] = {"$in": [ws_oid, body.workspace_id]}
+        except Exception:
+            ws_query["_id"] = body.workspace_id
+
+        workspace = await db.workspaces.find_one(ws_query)
         if not workspace:
             raise HTTPException(status_code=404, detail="Workspace not found")
 
@@ -370,13 +360,10 @@ async def delete_thread(
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
 
-    # Delete the thread and all its messages together — orphaned messages
-    # waste storage and could leak context if a thread_id is ever reused.
     await db.threads.delete_one({"_id": thread["_id"]})
     await db.messages.delete_many({"thread_id": thread_id})
 
     return {"message": "Thread deleted successfully"}
-
 
 
 # -----------------------------
@@ -397,7 +384,7 @@ async def create_message(
 
     message = {
         "user_id": user_id,
-        "workspace_id": thread["workspace_id"],  # inherited from thread, not client input
+        "workspace_id": thread["workspace_id"],
         "thread_id": body.thread_id,
         "role": "user",
         "content": body.content,

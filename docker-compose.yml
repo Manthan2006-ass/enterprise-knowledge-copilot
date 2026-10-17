@@ -1,51 +1,40 @@
 name: enterprise-copilot
 
+# ─── LOCAL DOCKER STACK ──────────────────────────────────────────────────────
+# Uses MongoDB Atlas for storage (same as cloud) and Groq for LLM.
+# Start with: docker compose up --build
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Reads SECRET_KEY, MONGO_URI, GROQ_API_KEY etc. from the root .env file.
+    # Do NOT commit that file — it contains secrets.
     env_file:
-      - .env                      # secrets go here as NAME=value lines
-    environment:
-      MONGO_URI: mongodb://mongo:27017
-      OLLAMA_BASE_URL: http://ollama:11434
-    depends_on:
-      - mongo
-      - ollama
+      - .env
     ports:
       - "8000:8000"
-    volumes:
-      - chroma_data:/app/chroma_db
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        # Bake the API URL into the JS bundle at build time.
+        VITE_API_URL: http://localhost:8000
     restart: unless-stopped
     depends_on:
       - backend
     ports:
-      - "5173:5173"
+      # nginx listens on 80 inside the container; map to 3000 on the host.
+      - "3000:80"
 
-  mongo:
-    image: mongo:7
-    restart: unless-stopped
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongo_data:/data/db
-
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-
-volumes:
-  chroma_data:
-  mongo_data:
-  ollama_data:
+volumes: {}

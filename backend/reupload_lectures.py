@@ -8,10 +8,15 @@ Usage:
 
 The script skips lectures already uploaded (checks MongoDB document records).
 """
+import sys
 import os
 import time
 import requests
 from jose import jwt
+
+# Force UTF-8 so emoji/special chars don't crash on Windows CP1252 terminals
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ---------- Config ----------
 RENDER_URL = "https://enterprise-knowledge-copilot-fj0z.onrender.com"

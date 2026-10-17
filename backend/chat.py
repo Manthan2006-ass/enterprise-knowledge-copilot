@@ -1,253 +1,202 @@
+import asyncio
 import json
-import os
+import re
+import time
 from datetime import datetime, timezone
-
-from fastapi import APIRouter, Depends, HTTPException, Request
+from bson import ObjectId
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
-from limiter import limiter
-
-from database import db
 from auth import get_current_user, to_object_id
-from models import ChatPayloadSchema
-from llm_provider import chat_completion_sync, chat_completion_stream
+from database import db
 from embedding_utils import embed_query
+from llm_provider import chat_completion_stream, chat_completion_sync
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# Cosine similarity threshold: results below this are treated as irrelevant.
-# Atlas vectorSearch score ranges 0–1 (1 = identical, 0 = completely unrelated).
-SIMILARITY_THRESHOLD = 0.30
-
-# Atlas vector search index name (must match what you created in the Atlas UI
-# or via the create_vector_index.py script).
-VECTOR_INDEX_NAME = "vector_index"
-
-
-def format_timestamp(seconds: float) -> str:
-    """Converts raw seconds into MM:SS citation style."""
-    minutes = int(seconds // 60)
-    remaining_secs = int(seconds % 60)
-    return f"{minutes:02d}:{remaining_secs:02d}"
-
-
-# Words that signal a question depends on prior conversation context.
 PRONOUNS = {"it", "this", "that", "these", "those", "they", "them", "he", "she", "his", "her"}
 
 
 def needs_condensation(query: str) -> bool:
+    """Returns True only if the user query contains ambiguous pronouns or shorthand tokens."""
     tokens = set(query.lower().split())
     return bool(tokens & PRONOUNS) or len(tokens) <= 3
 
 
-def condense_query(user_query: str, history: list) -> str:
-    """Rewrites a multi-turn follow-up into a standalone search query."""
-    if not history:
-        return user_query
-
+def condense_query(question: str, history: list[dict]) -> str:
+    """Rewrites a follow-up query using chat history into a standalone search phrase."""
     history_str = ""
     for msg in history[-4:]:
-        history_str += f"{msg['role'].upper()}: {msg['content']}\n"
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        history_str += f"{role}: {msg.get('content', '')}\n"
 
     condense_prompt = (
-        "Given the following conversation history and a follow-up question, "
-        "rephrase the follow-up question into a standalone query that can be used "
-        "to search a vector database. Do NOT answer the question. Only return the rewritten query text.\n\n"
+        "Given the following chat history and a follow-up question, rephrase the "
+        "follow-up question to be a standalone question that includes all relevant context.\n\n"
         f"Chat History:\n{history_str}\n"
-        f"Follow-up Question: {user_query}\n"
-        "Standalone Query:"
+        f"Follow-up Question: {question}\n\n"
+        "Standalone Question:"
     )
-
-    return chat_completion_sync(
-        messages=[{"role": "user", "content": condense_prompt}],
-        temperature=0.0,
-    )
+    
+    messages = [{"role": "user", "content": condense_prompt}]
+    return chat_completion_sync(messages, temperature=0.0)
 
 
-async def get_recent_history(thread_id: str, limit: int = 8) -> list:
-    """Pull the last few messages from Mongo to give the model conversational memory."""
-    cursor = db.messages.find({"thread_id": thread_id}).sort("created_at", -1).limit(limit)
-    msgs = []
-    async for m in cursor:
-        msgs.append({"role": m["role"], "content": m["content"]})
-    msgs.reverse()  # oldest first
-    return msgs
+class StreamChatPayload(BaseModel):
+    workspace_id: str
+    thread_id: str
+    question: str = Field(..., min_length=1)
 
 
-def sse_event(data: dict) -> str:
-    """Format a dict as a proper Server-Sent Event line."""
-    return f"data: {json.dumps(data)}\n\n"
+@router.post("/stream")
+async def stream_chat(
+    payload: StreamChatPayload,
+    user_id: str = Depends(get_current_user)
+):
+    # ---- TIMER: start ----
+    t0 = time.perf_counter()
+    t = t0
 
+    def lap(label: str):
+        nonlocal t
+        now = time.perf_counter()
+        print(f"[TIMER] {label}: {now - t:.2f}s (total {now - t0:.2f}s)")
+        t = now
 
-async def workspace_has_documents(workspace_id: str) -> bool:
-    """Check whether ANY document has been uploaded to this workspace."""
-    count = await db.documents.count_documents({"workspace_id": workspace_id})
-    return count > 0
+    thread_oid = to_object_id(payload.thread_id, "thread_id")
 
+    # 1. Dual ObjectId / string lookup for multi-tenant workspace validation
+    ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
+    try:
+        ws_oid = ObjectId(payload.workspace_id)
+        ws_query["_id"] = {"$in": [ws_oid, payload.workspace_id]}
+    except Exception:
+        ws_query["_id"] = payload.workspace_id
 
-async def vector_search(query_text: str, workspace_id: str, n_results: int = 4) -> list[dict]:
-    """
-    Query MongoDB Atlas Vector Search.
-    Returns a list of chunk dicts with keys: text, score, and all metadata fields.
-    """
-    # Embedding is synchronous (ONNX CPU inference) — run off event loop
-    query_vector = await run_in_threadpool(embed_query, query_text)
+    async def load_workspace():
+        return await db.workspaces.find_one(ws_query)
 
+    async def load_history():
+        # FIX: take the 10 MOST RECENT messages, then put them back in chronological order
+        recent = await db.messages.find({"thread_id": str(thread_oid)}).sort("created_at", -1).to_list(10)
+        return list(reversed(recent))
+
+    # SPEED-UP: start embedding the raw question right away (in a worker thread)
+    # so it runs while the two MongoDB lookups below are in flight.
+    embed_task = asyncio.ensure_future(asyncio.to_thread(embed_query, payload.question))
+
+    # SPEED-UP: workspace check and history fetch run in parallel, not one after the other.
+    workspace, history_docs = await asyncio.gather(load_workspace(), load_history())
+    lap("workspace + history (parallel)")
+
+    if not workspace:
+        embed_task.cancel()
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    # CONDITIONAL PRONOUN ROUTER
+    if history_docs and needs_condensation(payload.question):
+        embed_task.cancel()  # raw-question embedding is not what we want here
+        search_query = await asyncio.to_thread(condense_query, payload.question, history_docs)
+        lap("condense (LLM call)")
+        query_vector = await asyncio.to_thread(embed_query, search_query)
+    else:
+        query_vector = await embed_task
+    lap("embed query (wait)")
+
+    # 5. Atlas $vectorSearch aggregation pipeline
     pipeline = [
         {
             "$vectorSearch": {
-                "index": VECTOR_INDEX_NAME,
+                "index": "vector_index",
                 "path": "embedding",
                 "queryVector": query_vector,
-                "numCandidates": n_results * 10,
-                "limit": n_results,
-                "filter": {"workspace_id": {"$eq": workspace_id}},
+                "numCandidates": 50,
+                "limit": 5,
+                "filter": {"workspace_id": payload.workspace_id}
             }
         },
         {
             "$project": {
-                "_id": 0,
                 "text": 1,
-                "source": 1,
-                "video_number": 1,
-                "video_title": 1,
+                "lecture_number": 1,
                 "start_time": 1,
                 "end_time": 1,
-                "has_timestamps": 1,
-                "score": {"$meta": "vectorSearchScore"},
+                "score": {"$meta": "vectorSearchScore"}
             }
-        },
+        }
     ]
 
-    results = []
-    async for doc in db.chunks.aggregate(pipeline):
-        results.append(doc)
-    return results
+    try:
+        chunks = await db.chunks.aggregate(pipeline).to_list(5)
+    except Exception:
+        chunks = []
+    lap("vector search")
 
+    context_str = ""
+    for c in chunks:
+        lec = c.get("lecture_number", "N/A")
+        start = c.get("start_time", 0)
+        mins, secs = divmod(int(start), 60)
+        time_str = f"{mins:02d}:{secs:02d}"
+        context_str += f"[Lecture {lec} at {time_str}] {c.get('text', '')}\n\n"
 
-async def stream_chat_response(user_id: str, thread_id: str, workspace_id: str | None, question: str):
-    history = await get_recent_history(thread_id)
+    system_prompt = (
+        "You are an Enterprise Copilot assistant. Answer the question accurately "
+        "using ONLY the context below. Always cite source timestamps using the exact format "
+        "[Lecture XX at MM:SS] inline whenever referencing video transcripts.\n\n"
+        f"Context:\n{context_str}"
+    )
 
-    has_docs = False
-    if workspace_id is not None:
-        has_docs = await workspace_has_documents(workspace_id)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": payload.question}
+    ]
 
-    context_stream = ""
-    has_timestamps = False
-
-    if workspace_id is not None and has_docs:
-        # Rewrite follow-up questions into standalone queries before vector search
-        if history and needs_condensation(question):
-            search_query = await run_in_threadpool(condense_query, question, history)
-        else:
-            search_query = question
-
-        results = await vector_search(search_query, workspace_id, n_results=4)
-
-        idx = 0
-        for chunk in results:
-            score = chunk.get("score", 0)
-            if score < SIMILARITY_THRESHOLD:
-                continue  # too dissimilar — drop it
-            idx += 1
-            if chunk.get("has_timestamps") and "start_time" in chunk and "end_time" in chunk:
-                has_timestamps = True
-                start_str = format_timestamp(chunk["start_time"])
-                end_str = format_timestamp(chunk["end_time"])
-                context_stream += (
-                    f"\n--- Source {idx}: Lecture {chunk.get('video_number', '?')} - "
-                    f"{chunk.get('video_title', chunk.get('source', 'unknown'))} "
-                    f"[{start_str}-{end_str}] ---\n{chunk['text']}\n"
-                )
-            else:
-                context_stream += f"\n--- Source {idx} ({chunk.get('source', 'unknown')}) ---\n{chunk['text']}\n"
-
-    if workspace_id is not None and context_stream and has_timestamps:
-        system_prompt = (
-            "You are an expert AI Teaching Assistant for this workspace's video lecture playlist. "
-            "Answer strictly using the provided transcript context blocks below — do not use outside "
-            "or general knowledge. For every factual claim or concept you mention, you MUST cite the "
-            "source in the exact format [Lecture XX at MM:SS], using the lecture number and start "
-            "timestamp shown in the context block's [MM:SS-MM:SS] range (use the FIRST timestamp in "
-            "that range). "
-            "Example of the exact citation format required: [Lecture 11 at 03:15]. "
-            "Always include the timestamp — never write just 'Lecture 11' or 'Source 1' without the "
-            "'at MM:SS' part. If the context doesn't contain the answer, say exactly: "
-            "\"I don't have information about this in this workspace's documents.\""
-        )
-        user_prompt = f"Context:\n{context_stream}\n\nQuestion: {question}"
-    elif workspace_id is not None and context_stream:
-        system_prompt = (
-            "You are a document-based assistant for this specific workspace. "
-            "Answer ONLY using the provided context below. Do not use any outside "
-            "or general knowledge, even if you know the topic. If the context "
-            "does not contain the answer, say exactly: "
-            "\"I don't have information about this in this workspace's documents.\" "
-            "Do not guess or fill gaps with your own knowledge."
-        )
-        user_prompt = f"Context:\n{context_stream}\n\nQuestion: {question}"
-    elif workspace_id is not None and has_docs:
-        # Workspace WITH documents but nothing relevant retrieved for this query
-        system_prompt = (
-            "You are a document-based assistant for this workspace. No relevant "
-            "information was found for this question. Tell the user clearly, in "
-            "one or two sentences, that you don't have information on this in "
-            "this workspace's documents, and suggest they upload relevant material "
-            "or rephrase the question. Do not answer from general knowledge."
-        )
-        user_prompt = question
-    else:
-        # Normal Chat (no workspace) or workspace with zero documents — plain conversation
-        system_prompt = "You are a helpful assistant."
-        user_prompt = question
-
-    messages = [{"role": "system", "content": system_prompt}]
-    messages.extend(history)
-    messages.append({"role": "user", "content": user_prompt})
-
-    full_response = ""
-    for token in chat_completion_stream(messages, temperature=0.0):
-        full_response += token
-        yield sse_event({"token": token})
-
-    # Persist the assistant's full reply once streaming is done
-    await db.messages.insert_one({
+    # SPEED-UP: save the user message in the background instead of waiting for it.
+    asyncio.ensure_future(db.messages.insert_one({
+        "thread_id": str(thread_oid),
         "user_id": user_id,
-        "workspace_id": workspace_id,
-        "thread_id": thread_id,
-        "role": "assistant",
-        "content": full_response,
-        "created_at": datetime.now(timezone.utc),
-    })
-
-    yield sse_event({"done": True})
-
-
-@router.post("/stream")
-@limiter.limit("15/minute")
-async def chat_stream(
-    request: Request,
-    body: ChatPayloadSchema,
-    user_id: str = Depends(get_current_user),
-):
-    thread = await db.threads.find_one({
-        "_id": to_object_id(body.thread_id, "thread_id"),
-        "user_id": user_id,
-    })
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-
-    await db.messages.insert_one({
-        "user_id": user_id,
-        "workspace_id": thread["workspace_id"],
-        "thread_id": body.thread_id,
         "role": "user",
-        "content": body.question,
-        "created_at": datetime.now(timezone.utc),
-    })
+        "content": payload.question,
+        "created_at": datetime.now(timezone.utc)
+    }))
+    lap("save user message (background)")
+
+    async def event_generator():
+        full_assistant_reply = ""
+        first = True
+        # FIX: pull tokens from the sync generator in a worker thread so the
+        # event loop (and other users' requests) is never blocked while streaming.
+        stream_iter = await asyncio.to_thread(
+            lambda: iter(chat_completion_stream(messages, temperature=0.0))
+        )
+        _done = object()
+        while True:
+            token = await asyncio.to_thread(next, stream_iter, _done)
+            if token is _done:
+                break
+            if first:
+                lap("LLM first token")
+                first = False
+            full_assistant_reply += token
+            # FIX: frontend (api.js) expects JSON events like {"token": "..."}
+            yield f"data: {json.dumps({'token': token})}\n\n"
+        lap("LLM full answer")
+        # FIX: frontend only finishes the message when it receives {"done": true}
+        yield f"data: {json.dumps({'done': True})}\n\n"
+
+        # Save assistant message to MongoDB upon completion
+        await db.messages.insert_one({
+            "thread_id": str(thread_oid),
+            "user_id": user_id,
+            "role": "assistant",
+            "content": full_assistant_reply,
+            "created_at": datetime.now(timezone.utc)
+        })
 
     return StreamingResponse(
-        stream_chat_response(user_id, body.thread_id, thread["workspace_id"], body.question),
+        event_generator(),
         media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

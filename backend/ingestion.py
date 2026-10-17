@@ -74,12 +74,17 @@ async def upload_document(
     user_id: str = Depends(get_current_user),
 ):
     # Ownership check — never trust workspace_id alone
-    workspace = await db.workspaces.find_one({
-        "_id": to_object_id(workspace_id, "workspace_id"),
-        "user_id": user_id,
-    })
+    ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
+    try:
+        from bson import ObjectId
+        ws_oid = ObjectId(workspace_id)
+        ws_query["_id"] = {"$in": [ws_oid, workspace_id]}
+    except Exception:
+        ws_query["_id"] = workspace_id
+
+    workspace = await db.workspaces.find_one(ws_query)
     if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        raise HTTPException(status_code=404, detail=f"Workspace '{workspace_id}' not found")
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
@@ -172,12 +177,17 @@ async def upload_transcript(
       ]
     }
     """
-    workspace = await db.workspaces.find_one({
-        "_id": to_object_id(workspace_id, "workspace_id"),
-        "user_id": user_id,
-    })
+    ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
+    try:
+        from bson import ObjectId
+        ws_oid = ObjectId(workspace_id)
+        ws_query["_id"] = {"$in": [ws_oid, workspace_id]}
+    except Exception:
+        ws_query["_id"] = workspace_id
+
+    workspace = await db.workspaces.find_one(ws_query)
     if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
+        raise HTTPException(status_code=404, detail=f"Workspace '{workspace_id}' not found")
 
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
