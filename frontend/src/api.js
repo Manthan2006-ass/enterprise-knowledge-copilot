@@ -160,7 +160,15 @@ export const api = {
 
         if (!res.ok || !res.body) {
           const errBody = await res.json().catch(() => ({}));
-          throw new Error(errBody.detail || `Stream failed (${res.status})`);
+          let errMsg = `Stream failed (${res.status})`;
+          if (typeof errBody.detail === "string") {
+            errMsg = errBody.detail;
+          } else if (Array.isArray(errBody.detail)) {
+            errMsg = errBody.detail.map((e) => e.msg || JSON.stringify(e)).join(", ");
+          } else if (errBody.detail && typeof errBody.detail === "object") {
+            errMsg = JSON.stringify(errBody.detail);
+          }
+          throw new Error(errMsg);
         }
 
         const reader = res.body.getReader();

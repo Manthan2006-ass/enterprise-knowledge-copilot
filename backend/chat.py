@@ -44,7 +44,7 @@ def condense_query(question: str, history: list[dict]) -> str:
 
 
 class StreamChatPayload(BaseModel):
-    workspace_id: str
+    workspace_id: str | None = None
     thread_id: str
     question: str = Field(..., min_length=1)
 
@@ -66,103 +66,108 @@ async def stream_chat(
 
     thread_oid = to_object_id(payload.thread_id, "thread_id")
 
-    # 1. Dual ObjectId / string lookup for multi-tenant workspace validation
-    ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
-    try:
-        ws_oid = ObjectId(payload.workspace_id)
-        ws_query["_id"] = {"$in": [ws_oid, payload.workspace_id]}
-    except Exception:
-        ws_query["_id"] = payload.workspace_id
+    # Fetch last 10 messages from thread history
+    recent = await db.messages.find({"thread_id": str(thread_oid)}).sort("created_at", -1).to_list(10)
+    history_docs = list(reversed(recent))
+    lap("load history")
 
-    async def load_workspace():
-        return await db.workspaces.find_one(ws_query)
+    # Determine whether this is a workspace (RAG) chat or a normal general chat
+    is_workspace_chat = bool(payload.workspace_id and payload.workspace_id != "null")
 
-    async def load_history():
-        # FIX: take the 10 MOST RECENT messages, then put them back in chronological order
-        recent = await db.messages.find({"thread_id": str(thread_oid)}).sort("created_at", -1).to_list(10)
-        return list(reversed(recent))
-
-    # SPEED-UP: start embedding the raw question right away (in a worker thread)
-    # so it runs while the two MongoDB lookups below are in flight.
-    embed_task = asyncio.ensure_future(asyncio.to_thread(embed_query, payload.question))
-
-    # SPEED-UP: workspace check and history fetch run in parallel, not one after the other.
-    workspace, history_docs = await asyncio.gather(load_workspace(), load_history())
-    lap("workspace + history (parallel)")
-
-    if not workspace:
-        embed_task.cancel()
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-    # CONDITIONAL PRONOUN ROUTER
-    if history_docs and needs_condensation(payload.question):
-        embed_task.cancel()  # raw-question embedding is not what we want here
-        search_query = await asyncio.to_thread(condense_query, payload.question, history_docs)
-        lap("condense (LLM call)")
-        query_vector = await asyncio.to_thread(embed_query, search_query)
+    if not is_workspace_chat:
+        # ── Normal Chat: Direct LLM with multi-turn conversation memory ───────
+        system_prompt = (
+            "You are a helpful, knowledgeable, and polite AI assistant. "
+            "Answer the user's questions clearly, accurately, and thoroughly."
+        )
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in history_docs:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": payload.question})
+        lap("build normal messages")
     else:
-        query_vector = await embed_task
-    lap("embed query (wait)")
-
-    # 5. Atlas $vectorSearch aggregation pipeline
-    pipeline = [
-        {
-            "$vectorSearch": {
-                "index": "vector_index",
-                "path": "embedding",
-                "queryVector": query_vector,
-                "numCandidates": 50,
-                "limit": 5,
-                "filter": {"workspace_id": payload.workspace_id}
-            }
-        },
-        {
-            "$project": {
-                "text": 1,
-                "video_number": 1,
-                "video_title": 1,
-                "source": 1,
-                "lecture_number": 1,
-                "start_time": 1,
-                "end_time": 1,
-                "score": {"$meta": "vectorSearchScore"}
-            }
-        }
-    ]
-
-    try:
-        chunks = await db.chunks.aggregate(pipeline).to_list(5)
-    except Exception:
-        chunks = []
-    lap("vector search")
-
-    context_str = ""
-    for c in chunks:
-        raw_lec = c.get("video_number") or c.get("lecture_number") or ""
+        # ── Workspace Chat: RAG with MongoDB Atlas Vector Search ──────────────
+        ws_query = {"$or": [{"user_id": user_id}, {"is_public": True}]}
         try:
-            lec = f"{int(raw_lec):02d}"
-        except (ValueError, TypeError):
-            lec = str(raw_lec) if raw_lec else "01"
+            ws_oid = ObjectId(payload.workspace_id)
+            ws_query["_id"] = {"$in": [ws_oid, payload.workspace_id]}
+        except Exception:
+            ws_query["_id"] = payload.workspace_id
 
-        start = c.get("start_time", 0)
-        mins, secs = divmod(int(start), 60)
-        time_str = f"{mins:02d}:{secs:02d}"
-        context_str += f"[Lecture {lec} at {time_str}] {c.get('text', '')}\n\n"
+        workspace = await db.workspaces.find_one(ws_query)
+        if not workspace:
+            raise HTTPException(status_code=404, detail="Workspace not found")
 
-    system_prompt = (
-        "You are an AI teaching assistant for this video lecture course. Answer the question "
-        "accurately and thoroughly using the provided context below.\n"
-        "MANDATORY CITATION RULE:\n"
-        "Always cite source timestamps inline using the exact format [Lecture XX at MM:SS] "
-        "(for example: [Lecture 19 at 11:30]) whenever referencing concepts or quotes from the transcripts.\n"
-        "NEVER use 'Lecture N/A' — always cite the exact lecture number and timestamp provided in each context block.\n\n"
-        f"Context:\n{context_str}"
-    )
+        # CONDITIONAL PRONOUN ROUTER
+        if history_docs and needs_condensation(payload.question):
+            search_query = await asyncio.to_thread(condense_query, payload.question, history_docs)
+            lap("condense (LLM call)")
+            query_vector = await asyncio.to_thread(embed_query, search_query)
+        else:
+            query_vector = await asyncio.to_thread(embed_query, payload.question)
+        lap("embed query")
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": payload.question}
-    ]
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index",
+                    "path": "embedding",
+                    "queryVector": query_vector,
+                    "numCandidates": 50,
+                    "limit": 5,
+                    "filter": {"workspace_id": payload.workspace_id}
+                }
+            },
+            {
+                "$project": {
+                    "text": 1,
+                    "video_number": 1,
+                    "video_title": 1,
+                    "source": 1,
+                    "lecture_number": 1,
+                    "start_time": 1,
+                    "end_time": 1,
+                    "score": {"$meta": "vectorSearchScore"}
+                }
+            }
+        ]
+
+        try:
+            chunks = await db.chunks.aggregate(pipeline).to_list(5)
+        except Exception:
+            chunks = []
+        lap("vector search")
+
+        context_str = ""
+        for c in chunks:
+            raw_lec = c.get("video_number") or c.get("lecture_number") or ""
+            try:
+                lec = f"{int(raw_lec):02d}"
+            except (ValueError, TypeError):
+                lec = str(raw_lec) if raw_lec else "01"
+
+            start = c.get("start_time", 0)
+            mins, secs = divmod(int(start), 60)
+            time_str = f"{mins:02d}:{secs:02d}"
+            context_str += f"[Lecture {lec} at {time_str}] {c.get('text', '')}\n\n"
+
+        system_prompt = (
+            "You are an AI teaching assistant for this video lecture course. Answer the question "
+            "accurately and thoroughly using the provided context below.\n"
+            "MANDATORY CITATION RULE:\n"
+            "Always cite source timestamps inline using the exact format [Lecture XX at MM:SS] "
+            "(for example: [Lecture 19 at 11:30]) whenever referencing concepts or quotes from the transcripts.\n"
+            "NEVER use 'Lecture N/A' — always cite the exact lecture number and timestamp provided in each context block.\n\n"
+            f"Context:\n{context_str}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": payload.question}
+        ]
 
     # SPEED-UP: save the user message in the background instead of waiting for it.
     asyncio.ensure_future(db.messages.insert_one({
