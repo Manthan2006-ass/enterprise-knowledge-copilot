@@ -224,6 +224,12 @@ async def upload_transcript(
     if not texts:
         raise HTTPException(status_code=400, detail="Transcript produced no usable text chunks")
 
+    # Clean up any previous upload with the same filename in this workspace
+    old_doc = await db.documents.find_one({"workspace_id": workspace_id, "filename": file.filename})
+    if old_doc and old_doc.get("doc_id"):
+        await db.chunks.delete_many({"workspace_id": workspace_id, "doc_id": old_doc["doc_id"]})
+    await db.documents.delete_many({"workspace_id": workspace_id, "filename": file.filename})
+
     # Embed all chunks (CPU-bound → off event loop)
     mongo_docs = await run_in_threadpool(_embed_and_build_docs, texts, metadatas, doc_id)
     if mongo_docs:
