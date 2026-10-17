@@ -507,16 +507,206 @@ input {
 .citation-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
   background: var(--sage-soft);
   color: var(--sage);
   border: 1px solid var(--sage);
   border-radius: 999px;
-  padding: 2px 10px;
+  padding: 3px 10px;
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
-  margin: 0 2px;
+  margin: 0 3px;
+  text-decoration: none;
+  vertical-align: middle;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.citation-chip.clickable {
+  cursor: pointer;
+}
+
+.citation-chip.clickable:hover {
+  background: var(--sage);
+  color: #ffffff;
+  transform: translateY(-1.5px);
+  box-shadow: 0 4px 10px rgba(78, 110, 89, 0.25);
+}
+
+.citation-chip .play-icon {
+  display: inline-block;
+  font-size: 9px;
+  opacity: 0.8;
+  margin-left: 2px;
+  transition: transform 0.15s ease;
+}
+
+.citation-chip.clickable:hover .play-icon {
+  opacity: 1;
+  transform: scale(1.2);
+}
+
+/* ── Video Modal Player ────────────────────────────── */
+.video-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(18, 20, 24, 0.75);
+  backdrop-filter: blur(6px);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  animation: fadeIn 0.2s ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.video-modal-card {
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(0, 0, 0, 0.08);
+  width: 100%;
+  max-width: 820px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  animation: modalSlideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes modalSlideUp {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+.video-modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  background: #f8f9fa;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.video-modal-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.video-badge {
+  background: var(--ink);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 6px;
+  letter-spacing: 0.3px;
+}
+
+.timestamp-badge {
+  background: var(--sage);
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 6px;
+}
+
+.video-modal-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #343a40;
+  max-width: 440px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.video-modal-close {
+  background: transparent;
+  border: none;
+  font-size: 18px;
+  font-weight: 600;
+  color: #6c757d;
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 8px;
+  line-height: 1;
+  transition: all 0.15s ease;
+}
+
+.video-modal-close:hover {
+  background: #e9ecef;
+  color: #212529;
+}
+
+.video-modal-body {
+  position: relative;
+  width: 100%;
+  padding-top: 56.25%; /* 16:9 Aspect Ratio */
+  background: #000000;
+}
+
+.video-iframe {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.video-fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #adb5bd;
+}
+
+.video-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: #f8f9fa;
+  border-top: 1px solid #e9ecef;
+}
+
+.video-footer-tip {
+  font-size: 12px;
+  color: #6c757d;
+}
+
+.btn-open-youtube {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #ff0000;
+  color: #ffffff !important;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 8px;
+  text-decoration: none !important;
+  transition: background 0.15s ease, transform 0.15s ease;
+}
+
+.btn-open-youtube:hover {
+  background: #cc0000;
+  transform: translateY(-1px);
 }
 
 .bubble.user .bubble-content {

@@ -34,27 +34,66 @@ function injectCitationLinks(text) {
   return text.replace(FALLBACK_CITATION_GLOBAL, chipify);
 }
 
-// Custom renderer passed to ReactMarkdown - only special-cases links whose
-// href we generated above (#citation:...); every other link renders normally.
-const markdownComponents = {
-  a: ({ href, children }) => {
-    if (href && href.startsWith("#citation:")) {
-      return (
-        <span
-          className="citation-chip"
-          onClick={(e) => e.preventDefault()}
-        >
-          {children}
-        </span>
-      );
-    }
-    return (
-      <a href={href} target="_blank" rel="noreferrer">
-        {children}
-      </a>
-    );
-  },
+// Exact mapping of the 21 CampusX GenAI/LangChain lectures to their YouTube video IDs
+export const LECTURE_VIDEO_MAP = {
+  1: { id: "pSVk-5WemQ0", title: "GenAI Roadmap for Beginners" },
+  2: { id: "_3ezSpJw2E8", title: "Generative AI using LangChain" },
+  3: { id: "nlz9j-r0U9U", title: "Introduction to LangChain" },
+  4: { id: "-xSJA8-o6Eg", title: "LangChain Components" },
+  5: { id: "HdcLE8JuMrA", title: "LangChain Models Tutorial" },
+  6: { id: "3TGqlQxpuU0", title: "Prompts in LangChain" },
+  7: { id: "y5EmRr1O1h4", title: "Structured Output in LangChain" },
+  8: { id: "Op6PbJZ5b2Q", title: "Output Parsers in LangChain" },
+  9: { id: "5hjrPILA3-8", title: "Chains in LangChain" },
+  10: { id: "u3b-W1NgYa4", title: "What are Runnables in LangChain" },
+  11: { id: "47nc0n-e4_w", title: "Langchain Runnables Part 2" },
+  12: { id: "bL92ALSZ2Cg", title: "Document Loaders in LangChain" },
+  13: { id: "SEWS9P4ODmc", title: "Text Splitters in LangChain" },
+  14: { id: "k13WK0bxQP0", title: "Vector Stores in LangChain" },
+  15: { id: "pJdMxwXBsk0", title: "Retrievers in LangChain" },
+  16: { id: "X0btK9X0Xnk", title: "Retrieval Augmented Generation (RAG)" },
+  17: { id: "J5_-l7WIO_w", title: "YouTube Chatbot using LangChain" },
+  18: { id: "etnLX7m2MiA", title: "Tools in LangChain" },
+  19: { id: "EzYaFF7ahKw", title: "Tool Calling in LangChain" },
+  20: { id: "gm_lQG8fYjI", title: "Building End-to-End AI Agent" },
+  21: { id: "YcAYmIFtA0o", title: "Ollama Masterclass 2026" },
 };
+
+export function getLectureVideoUrl(lectureNum, timeStr) {
+  const num = parseInt(lectureNum, 10);
+  const entry = LECTURE_VIDEO_MAP[num];
+
+  let totalSeconds = 0;
+  if (timeStr) {
+    const parts = timeStr.split(":").map(Number);
+    if (parts.length === 2) {
+      totalSeconds = (parts[0] || 0) * 60 + (parts[1] || 0);
+    } else if (parts.length === 3) {
+      totalSeconds = (parts[0] || 0) * 3600 + (parts[1] || 0) * 60 + (parts[2] || 0);
+    }
+  }
+
+  if (entry && entry.id) {
+    return {
+      youtubeUrl: `https://www.youtube.com/watch?v=${entry.id}&t=${totalSeconds}s`,
+      embedUrl: `https://www.youtube.com/embed/${entry.id}?start=${totalSeconds}&autoplay=1`,
+      title: entry.title,
+      seconds: totalSeconds,
+      lectureNum: num,
+      timeStr,
+    };
+  }
+
+  const query = encodeURIComponent(`CampusX Lecture ${lectureNum}`);
+  return {
+    youtubeUrl: `https://www.youtube.com/results?search_query=${query}`,
+    embedUrl: null,
+    title: `Lecture ${lectureNum}`,
+    seconds: totalSeconds,
+    lectureNum: num,
+    timeStr,
+  };
+}
 
 export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorkspaceOwner = true }) {
   const { token } = useAuth();
@@ -63,6 +102,38 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
   const [streamingText, setStreamingText] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [documents, setDocuments] = useState([]);
+  const [activeVideoCitation, setActiveVideoCitation] = useState(null);
+
+  const markdownComponents = React.useMemo(() => ({
+    a: ({ href, children }) => {
+      if (href && href.startsWith("#citation:")) {
+        const parts = href.replace("#citation:", "").split(":");
+        const lecture = parts[0];
+        const time = parts.slice(1).join(":");
+        const citationData = getLectureVideoUrl(lecture, time);
+
+        return (
+          <a
+            href={citationData.youtubeUrl}
+            className="citation-chip clickable"
+            onClick={(e) => {
+              e.preventDefault();
+              setActiveVideoCitation(citationData);
+            }}
+            title={`▶ Watch Lecture ${lecture} at ${time} · ${citationData.title}`}
+          >
+            {children}
+            <span className="play-icon">▶</span>
+          </a>
+        );
+      }
+      return (
+        <a href={href} target="_blank" rel="noreferrer">
+          {children}
+        </a>
+      );
+    },
+  }), []);
   const [uploading, setUploading] = useState(false);
   const [suggestedQuestions, setSuggestedQuestions] = useState([]);
   const [loadingQuestions, setLoadingQuestions] = useState(false);
@@ -409,6 +480,71 @@ export default function ChatWindow({ threadId, workspaceId, threadTitle, isWorks
           Send
         </button>
       </form>
+
+      {/* Interactive Video Citation Player Modal */}
+      {activeVideoCitation && (
+        <div
+          className="video-modal-backdrop"
+          onClick={() => setActiveVideoCitation(null)}
+        >
+          <div
+            className="video-modal-card"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="video-modal-header">
+              <div className="video-modal-meta">
+                <span className="video-badge">
+                  🎬 Lecture {activeVideoCitation.lectureNum}
+                </span>
+                <span className="timestamp-badge">
+                  ⏱️ {activeVideoCitation.timeStr}
+                </span>
+                <span className="video-modal-title">
+                  {activeVideoCitation.title}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="video-modal-close"
+                onClick={() => setActiveVideoCitation(null)}
+                aria-label="Close video player"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="video-modal-body">
+              {activeVideoCitation.embedUrl ? (
+                <iframe
+                  className="video-iframe"
+                  src={activeVideoCitation.embedUrl}
+                  title={activeVideoCitation.title}
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                  allowFullScreen
+                />
+              ) : (
+                <div className="video-fallback">
+                  <p>Direct video preview unavailable.</p>
+                </div>
+              )}
+            </div>
+
+            <div className="video-modal-footer">
+              <span className="video-footer-tip">
+                💡 Playing automatically from timestamp <strong>{activeVideoCitation.timeStr}</strong>
+              </span>
+              <a
+                href={activeVideoCitation.youtubeUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-open-youtube"
+              >
+                Open on YouTube ↗
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
