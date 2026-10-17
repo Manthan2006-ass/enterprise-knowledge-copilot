@@ -119,6 +119,9 @@ async def stream_chat(
         {
             "$project": {
                 "text": 1,
+                "video_number": 1,
+                "video_title": 1,
+                "source": 1,
                 "lecture_number": 1,
                 "start_time": 1,
                 "end_time": 1,
@@ -135,16 +138,24 @@ async def stream_chat(
 
     context_str = ""
     for c in chunks:
-        lec = c.get("lecture_number", "N/A")
+        raw_lec = c.get("video_number") or c.get("lecture_number") or ""
+        try:
+            lec = f"{int(raw_lec):02d}"
+        except (ValueError, TypeError):
+            lec = str(raw_lec) if raw_lec else "01"
+
         start = c.get("start_time", 0)
         mins, secs = divmod(int(start), 60)
         time_str = f"{mins:02d}:{secs:02d}"
         context_str += f"[Lecture {lec} at {time_str}] {c.get('text', '')}\n\n"
 
     system_prompt = (
-        "You are an Enterprise Copilot assistant. Answer the question accurately "
-        "using ONLY the context below. Always cite source timestamps using the exact format "
-        "[Lecture XX at MM:SS] inline whenever referencing video transcripts.\n\n"
+        "You are an AI teaching assistant for this video lecture course. Answer the question "
+        "accurately and thoroughly using the provided context below.\n"
+        "MANDATORY CITATION RULE:\n"
+        "Always cite source timestamps inline using the exact format [Lecture XX at MM:SS] "
+        "(for example: [Lecture 19 at 11:30]) whenever referencing concepts or quotes from the transcripts.\n"
+        "NEVER use 'Lecture N/A' — always cite the exact lecture number and timestamp provided in each context block.\n\n"
         f"Context:\n{context_str}"
     )
 
